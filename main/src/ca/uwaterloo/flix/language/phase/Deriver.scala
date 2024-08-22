@@ -17,6 +17,7 @@ package ca.uwaterloo.flix.language.phase
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.Ast.BoundBy
+import ca.uwaterloo.flix.language.ast.Ast.TypeSource.Ascribed
 import ca.uwaterloo.flix.language.ast.{Ast, Kind, KindedAst, Name, Scheme, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor}
 import ca.uwaterloo.flix.language.dbg.AstPrinter.DebugKindedAst
 import ca.uwaterloo.flix.language.dbg.AstPrinter.DebugValidation
@@ -42,12 +43,19 @@ object Deriver {
 
   val DerivableSyms = List(EqSym, OrderSym, ToStringSym, HashSym, SendableSym, CoerceSym)
 
+  val Param1Name = "a"
+  val Param2Name = "b"
+  val GetMethodName = "get"
+  val PutMethodName = "put"
+
   def run(root: KindedAst.Root)(implicit flix: Flix): Validation[KindedAst.Root, DerivationError] = flix.phase("Deriver") {
     val derivedInstances = ParOps.parTraverse(root.enums.values)(getDerivedInstances(_, root))
+    val structFieldInstances = root.structs.values.map(getInstancesOfStruct(_, root))
+    val fieldNames = root.structs.values.flatMap(struct => struct.fields).map(field => Name.Label(field.sym.name, field.sym.loc)).toSet
 
     mapN(derivedInstances) {
       instances =>
-        val newInstances = instances.flatten.foldLeft(root.instances) {
+        val newInstances = (instances ++ structFieldInstances).flatten.foldLeft(root.instances) {
           case (acc, inst) =>
             val accInsts = acc.getOrElse(inst.trt.sym, Nil)
             acc + (inst.trt.sym -> (inst :: accInsts))
@@ -55,6 +63,190 @@ object Deriver {
         root.copy(instances = newInstances)
     }
   }(DebugValidation())
+
+  /**
+    * Build the name of the get trait for this struct field
+    */
+  def structFieldGetTraitName(fieldName: String): String = "DotGet_" + fieldName
+
+  /**
+    * Build the name of the put trait for this struct field
+    */
+  def structFieldPutTraitName(fieldName: String): String = "DotPut_" + fieldName
+
+  /**
+    * Builds the associated type signature for the struct field
+    */
+  def structAssocTypeSig(tparam: KindedAst.TypeParam, kind: Kind, sym: Symbol.AssocTypeSym, loc: SourceLocation) =
+    KindedAst.AssocTypeSig(
+      doc = Ast.Doc(Nil, loc),
+      mod = Ast.Modifiers.Empty,
+      sym = sym,
+      tparam = tparam,
+      kind = kind,
+      tpe = None,
+      loc = loc
+    )
+  /**
+    * Builds the instances for this struct
+    */
+  private def getInstancesOfStruct(struct0: KindedAst.Struct, root: KindedAst.Root)(implicit flix: Flix): List[KindedAst.Instance] =
+      struct0.fields.flatMap(f => List(fieldPutInstance(struct0, f, root), fieldGetInstance(struct0, f, root)))
+
+  /**
+    * Builds the instances for the `get` operation of this struct field
+    */
+  private def fieldGetInstance(struct0: KindedAst.Struct, field: KindedAst.StructField, root: KindedAst.Root)(implicit flix: Flix): KindedAst.Instance = {
+    val loc = field.loc
+    val (fields, structType, eff) = Kinder.instantiateStruct(struct0.sym, root.structs)
+    val fieldType = fields(field.sym)
+    val traitSym = Symbol.mkTraitSym(structFieldGetTraitName(field.sym.name))
+    val assocTypeSym = Symbol.mkAssocTypeSym(traitSym, Name.Ident("FieldType", loc))
+    val assocEffSym = Symbol.mkAssocTypeSym(traitSym, Name.Ident("Aef", loc))
+    val assocTypeSymUse = Ast.AssocTypeSymUse(assocTypeSym, loc)
+    val assocEffSymUse = Ast.AssocTypeSymUse(assocEffSym, loc)
+    val assocTpe = fieldAssocTypeDef(assocTypeSymUse, structType, fieldType, loc)
+    val assocEff = fieldAssocTypeDef(assocEffSymUse, structType, eff, loc)
+    val param1Symbol = Symbol.freshVarSym(Param1Name, BoundBy.FormalParam, loc)
+    val getSpec = fieldGetSpec(structType, eff, fieldType, Nil, param1Symbol, loc)
+    val getExpr = fieldGetImpl(param1Symbol, field, loc)
+    val getDef = KindedAst.Def(fieldDefnSymbol(structFieldGetTraitName(field.sym.name), GetMethodName), getSpec, getExpr)
+    KindedAst.Instance(
+      doc = Ast.Doc(Nil, loc),
+      ann = Ast.Annotations.Empty,
+      mod = Ast.Modifiers.Empty,
+      trt = Ast.TraitSymUse(traitSym, loc),
+      tpe = structType,
+      tconstrs = List(),
+      assocs = List(assocTpe, assocEff),
+      defs = List(getDef),
+      ns = Name.RootNS,
+      loc = loc)
+  }
+
+  /**
+    * Builds the instance for this `put` operation of this struct field
+    */
+  private def fieldPutInstance(struct0: KindedAst.Struct, field: KindedAst.StructField, root: KindedAst.Root)(implicit flix: Flix): KindedAst.Instance = {
+    val loc = field.loc
+    val (fields, structType, eff) = Kinder.instantiateStruct(struct0.sym, root.structs)
+    val fieldType = fields(field.sym)
+    val traitSym = Symbol.mkTraitSym(structFieldPutTraitName(field.sym.name))
+    val assocTypeSym = Symbol.mkAssocTypeSym(traitSym, Name.Ident("FieldType", loc))
+    val assocEffSym = Symbol.mkAssocTypeSym(traitSym, Name.Ident("Aef", loc))
+    val assocTypeSymUse = Ast.AssocTypeSymUse(assocTypeSym, loc)
+    val assocEffSymUse = Ast.AssocTypeSymUse(assocEffSym, loc)
+    val assocTpe = fieldAssocTypeDef(assocTypeSymUse, structType, fieldType, loc)
+    val assocEff = fieldAssocTypeDef(assocEffSymUse, structType, eff, loc)
+    val param1Symbol = Symbol.freshVarSym(Param1Name, BoundBy.FormalParam, loc)
+    val param2Symbol = Symbol.freshVarSym(Param2Name, BoundBy.FormalParam, loc)
+    val putSpec = fieldPutSpec(structType, eff, fieldType, Nil, param1Symbol, param2Symbol, loc)
+    val putExpr = fieldPutImpl(param1Symbol, param2Symbol, field, loc)
+    val putDef = KindedAst.Def(fieldDefnSymbol(structFieldPutTraitName(field.sym.name), PutMethodName), putSpec, putExpr)
+    KindedAst.Instance(
+      doc = Ast.Doc(Nil, loc),
+      ann = Ast.Annotations.Empty,
+      mod = Ast.Modifiers.Empty,
+      trt = Ast.TraitSymUse(traitSym, loc),
+      tpe = structType,
+      tconstrs = List(),
+      assocs = List(assocTpe, assocEff),
+      defs = List(putDef),
+      ns = Name.RootNS,
+      loc = loc)
+  }
+
+  /**
+    * Builds the definition for the associated type
+    */
+  private def fieldAssocTypeDef(sym: Ast.AssocTypeSymUse, arg: Type, tpe: Type, loc: SourceLocation): KindedAst.AssocTypeDef =
+    KindedAst.AssocTypeDef(
+      doc = Ast.Doc(Nil, loc),
+      mod = Ast.Modifiers.Empty,
+      sym = sym,
+      arg = arg,
+      tpe = tpe,
+      loc = loc
+    )
+
+  /**
+    * Builds the definition symbol for the struct instance method
+    */
+  def fieldDefnSymbol(traitName: String, methodName: String)(implicit flix: Flix): Symbol.DefnSym =
+    Symbol.mkDefnSym(traitName + "." + methodName, Some(flix.genSym.freshId()))
+
+  /**
+    * Builds the body for the `put` operation
+    */
+  private def fieldPutImpl(param1Symbol: Symbol.VarSym, param2Symbol: Symbol.VarSym, field: KindedAst.StructField, loc: SourceLocation)(implicit flix: Flix): KindedAst.Expr.StructPut =
+    KindedAst.Expr.StructPut(
+      exp1 = KindedAst.Expr.Var(param1Symbol, loc),
+      sym = field.sym,
+      exp2 = KindedAst.Expr.Var(param2Symbol, loc),
+      tvar = Type.freshVar(Kind.Star, loc),
+      evar = Type.freshVar(Kind.Eff, loc),
+      loc = loc
+    )
+
+  /**
+    * Builds the body for the `get` operation
+    */
+  private def fieldGetImpl(param1Symbol: Symbol.VarSym, field: KindedAst.StructField, loc: SourceLocation)(implicit flix: Flix): KindedAst.Expr.StructGet =
+    KindedAst.Expr.StructGet(
+      exp = KindedAst.Expr.Var(param1Symbol, loc),
+      sym = field.sym,
+      tvar = Type.freshVar(Kind.Star, loc),
+      evar = Type.freshVar(Kind.Eff, loc),
+      loc = loc
+    )
+
+  /**
+    * Builds the spec for this struct field's `get` operation
+    */
+  private def fieldGetSpec(structType: Type, structEff: Type, fieldType: Type, tparams: List[KindedAst.TypeParam], param1Symbol: Symbol.VarSym, loc: SourceLocation)(implicit flix: Flix): KindedAst.Spec =
+    KindedAst.Spec(
+      doc = Ast.Doc(Nil, loc),
+      ann = Ast.Annotations.Empty,
+      mod = Ast.Modifiers.Empty,
+      tparams = tparams,
+      fparams = List(KindedAst.FormalParam(param1Symbol, Ast.Modifiers.Empty, structType, Ast.TypeSource.Ascribed, loc)),
+      sc = Scheme(
+        tparams.map(_.sym),
+        Nil,
+        Nil,
+        Type.mkUncurriedArrowWithEffect(List(structType), structEff, fieldType, loc)
+      ),
+      tpe = fieldType,
+      eff = structEff,
+      tconstrs = List(),
+      econstrs = List(),
+      loc = loc
+    )
+
+  /**
+    * Builds the spec for this struct field's `put` operation
+    */
+  private def fieldPutSpec(structType: Type, structEff: Type, fieldType: Type, tparams: List[KindedAst.TypeParam], param1Symbol: Symbol.VarSym, param2Symbol: Symbol.VarSym, loc: SourceLocation)(implicit flix: Flix): KindedAst.Spec =
+    KindedAst.Spec(
+      doc = Ast.Doc(Nil, loc),
+      ann = Ast.Annotations.Empty,
+      mod = Ast.Modifiers.Empty,
+      tparams = tparams,
+      fparams = List(
+        KindedAst.FormalParam(param1Symbol, Ast.Modifiers.Empty, structType, Ast.TypeSource.Ascribed, loc),
+        KindedAst.FormalParam(param2Symbol, Ast.Modifiers.Empty, fieldType, Ast.TypeSource.Ascribed, loc)),
+      sc = Scheme(
+        tparams.map(_.sym),
+        Nil,
+        Nil,
+        Type.mkUncurriedArrowWithEffect(List(structType, fieldType), structEff, Type.Unit, loc)
+      ),
+      tpe = Type.Unit,
+      eff = structEff,
+      tconstrs = List(),
+      econstrs = List(),
+      loc = loc
+    )
 
   /**
     * Builds the instances derived from this enum.
@@ -111,7 +303,7 @@ object Deriver {
 
       val defn = KindedAst.Def(eqDefSym, spec, exp)
 
-      val tconstrs = getTypeConstraintsForTypeParams(tparams, eqTraitSym, loc)
+      val tconstrs = getTraitConstraintsForTypeParams(tparams, eqTraitSym, loc)
 
       Validation.success(KindedAst.Instance(
         doc = Ast.Doc(Nil, loc),
@@ -164,13 +356,13 @@ object Deriver {
         ),
         sc = Scheme(
           tparams.map(_.sym),
-          List(Ast.TypeConstraint(Ast.TypeConstraint.Head(eqTraitSym, loc), tpe, loc)),
+          List(Ast.TraitConstraint(Ast.TraitConstraint.Head(eqTraitSym, loc), tpe, loc)),
           Nil,
           Type.mkPureUncurriedArrow(List(tpe, tpe), Type.mkBool(loc), loc)
         ),
         tpe = Type.mkBool(loc),
         eff = Type.Cst(TypeConstructor.Pure, loc),
-        tconstrs = List(Ast.TypeConstraint(Ast.TypeConstraint.Head(eqTraitSym, loc), tpe, loc)),
+        tconstrs = List(Ast.TraitConstraint(Ast.TraitConstraint.Head(eqTraitSym, loc), tpe, loc)),
         econstrs = Nil,
         loc = loc
       )
@@ -262,7 +454,7 @@ object Deriver {
 
       val defn = KindedAst.Def(compareDefSym, spec, exp)
 
-      val tconstrs = getTypeConstraintsForTypeParams(tparams, orderTraitSym, loc)
+      val tconstrs = getTraitConstraintsForTypeParams(tparams, orderTraitSym, loc)
       Validation.success(KindedAst.Instance(
         doc = Ast.Doc(Nil, loc),
         ann = Ast.Annotations.Empty,
@@ -357,13 +549,13 @@ object Deriver {
         ),
         sc = Scheme(
           tparams.map(_.sym),
-          List(Ast.TypeConstraint(Ast.TypeConstraint.Head(orderTraitSym, loc), tpe, loc)),
+          List(Ast.TraitConstraint(Ast.TraitConstraint.Head(orderTraitSym, loc), tpe, loc)),
           Nil,
           Type.mkPureUncurriedArrow(List(tpe, tpe), Type.mkEnum(comparisonEnumSym, Kind.Star, loc), loc)
         ),
         tpe = Type.mkEnum(comparisonEnumSym, Kind.Star, loc),
         eff = Type.Cst(TypeConstructor.Pure, loc),
-        tconstrs = List(Ast.TypeConstraint(Ast.TypeConstraint.Head(orderTraitSym, loc), tpe, loc)),
+        tconstrs = List(Ast.TraitConstraint(Ast.TraitConstraint.Head(orderTraitSym, loc), tpe, loc)),
         econstrs = Nil,
         loc = loc
       )
@@ -382,7 +574,7 @@ object Deriver {
 
   /**
     * Creates a comparison match rule, comparing the elements of two tags of the same type.
-    * ```case (C2(x0, x1), C2(y0, y1)) => compare(x0, y0) `thenCompare` lazy(x1, y1)```
+    * {{{ case (C2(x0, x1), C2(y0, y1)) => compare(x0, y0) thenCompare lazy(x1, y1) }}}
     */
   private def mkComparePairMatchRule(caze: KindedAst.Case, loc: SourceLocation, root: KindedAst.Root)(implicit flix: Flix): KindedAst.MatchRule = caze match {
     case KindedAst.Case(sym, tpe, _, _) =>
@@ -430,7 +622,7 @@ object Deriver {
       }
 
       // Put it all together
-      // ```compare(x0, y0) `thenCompare` lazy compare(x1, y1)```
+      // compare(x0, y0) `thenCompare` lazy compare(x1, y1)
       val exp = compares match {
         // Case 1: no variables to compare; just return true
         case Nil => KindedAst.Expr.Tag(Ast.CaseSymUse(equalToSym, loc), KindedAst.Expr.Cst(Ast.Constant.Unit, loc), Type.freshVar(Kind.Star, loc), loc)
@@ -475,7 +667,7 @@ object Deriver {
 
       val defn = KindedAst.Def(toStringDefSym, spec, exp)
 
-      val tconstrs = getTypeConstraintsForTypeParams(tparams, toStringTraitSym, loc)
+      val tconstrs = getTraitConstraintsForTypeParams(tparams, toStringTraitSym, loc)
 
       Validation.success(KindedAst.Instance(
         doc = Ast.Doc(Nil, loc),
@@ -521,13 +713,13 @@ object Deriver {
         fparams = List(KindedAst.FormalParam(param, Ast.Modifiers.Empty, tpe, Ast.TypeSource.Ascribed, loc)),
         sc = Scheme(
           tparams.map(_.sym),
-          List(Ast.TypeConstraint(Ast.TypeConstraint.Head(toStringTraitSym, loc), tpe, loc)),
+          List(Ast.TraitConstraint(Ast.TraitConstraint.Head(toStringTraitSym, loc), tpe, loc)),
           Nil,
           Type.mkPureArrow(tpe, Type.mkString(loc), loc)
         ),
         tpe = Type.mkString(loc),
         eff = Type.Cst(TypeConstructor.Pure, loc),
-        tconstrs = List(Ast.TypeConstraint(Ast.TypeConstraint.Head(toStringTraitSym, loc), tpe, loc)),
+        tconstrs = List(Ast.TraitConstraint(Ast.TraitConstraint.Head(toStringTraitSym, loc), tpe, loc)),
         econstrs = Nil,
         loc = loc
       )
@@ -611,7 +803,7 @@ object Deriver {
 
       val defn = KindedAst.Def(hashDefSym, spec, exp)
 
-      val tconstrs = getTypeConstraintsForTypeParams(tparams, hashTraitSym, loc)
+      val tconstrs = getTraitConstraintsForTypeParams(tparams, hashTraitSym, loc)
       Validation.success(KindedAst.Instance(
         doc = Ast.Doc(Nil, loc),
         ann = Ast.Annotations.Empty,
@@ -658,13 +850,13 @@ object Deriver {
         fparams = List(KindedAst.FormalParam(param, Ast.Modifiers.Empty, tpe, Ast.TypeSource.Ascribed, loc)),
         sc = Scheme(
           tparams.map(_.sym),
-          List(Ast.TypeConstraint(Ast.TypeConstraint.Head(hashTraitSym, loc), tpe, loc)),
+          List(Ast.TraitConstraint(Ast.TraitConstraint.Head(hashTraitSym, loc), tpe, loc)),
           Nil,
           Type.mkPureArrow(tpe, Type.mkInt32(loc), loc)
         ),
         tpe = Type.mkInt32(loc),
         eff = Type.Cst(TypeConstructor.Pure, loc),
-        tconstrs = List(Ast.TypeConstraint(Ast.TypeConstraint.Head(hashTraitSym, loc), tpe, loc)),
+        tconstrs = List(Ast.TraitConstraint(Ast.TraitConstraint.Head(hashTraitSym, loc), tpe, loc)),
         econstrs = Nil,
         loc = loc
       )
@@ -732,7 +924,7 @@ object Deriver {
     case KindedAst.Enum(_, _, _, _, tparams, _, _, tpe, _) =>
       val sendableTraitSym = PredefinedTraits.lookupTraitSym("Sendable", root)
 
-      val tconstrs = getTypeConstraintsForTypeParams(tparams, sendableTraitSym, loc)
+      val tconstrs = getTraitConstraintsForTypeParams(tparams, sendableTraitSym, loc)
 
       Validation.success(KindedAst.Instance(
         doc = Ast.Doc(Nil, loc),
@@ -842,13 +1034,13 @@ object Deriver {
         fparams = List(KindedAst.FormalParam(param, Ast.Modifiers.Empty, tpe, Ast.TypeSource.Ascribed, loc)),
         sc = Scheme(
           tparams.map(_.sym),
-          List(Ast.TypeConstraint(Ast.TypeConstraint.Head(coerceTraitSym, loc), tpe, loc)),
+          List(Ast.TraitConstraint(Ast.TraitConstraint.Head(coerceTraitSym, loc), tpe, loc)),
           Nil,
           Type.mkPureArrow(tpe, retTpe, loc)
         ),
         tpe = retTpe,
         eff = Type.Cst(TypeConstructor.Pure, loc),
-        tconstrs = List(Ast.TypeConstraint(Ast.TypeConstraint.Head(coerceTraitSym, loc), tpe, loc)),
+        tconstrs = List(Ast.TraitConstraint(Ast.TraitConstraint.Head(coerceTraitSym, loc), tpe, loc)),
         econstrs = Nil,
         loc = loc
       )
@@ -879,12 +1071,12 @@ object Deriver {
   }
 
   /**
-    * Creates type constraints for the given type parameters.
+    * Creates trait constraints for the given type parameters.
     * Filters out non-star type parameters and wild type parameters.
     */
-  private def getTypeConstraintsForTypeParams(tparams: List[KindedAst.TypeParam], trt: Symbol.TraitSym, loc: SourceLocation): List[Ast.TypeConstraint] = tparams.collect {
+  private def getTraitConstraintsForTypeParams(tparams: List[KindedAst.TypeParam], trt: Symbol.TraitSym, loc: SourceLocation): List[Ast.TraitConstraint] = tparams.collect {
     case tparam if tparam.sym.kind == Kind.Star && !tparam.name.isWild =>
-      Ast.TypeConstraint(Ast.TypeConstraint.Head(trt, loc), Type.Var(tparam.sym, loc), loc)
+      Ast.TraitConstraint(Ast.TraitConstraint.Head(trt, loc), Type.Var(tparam.sym, loc), loc)
   }
 
   /**
